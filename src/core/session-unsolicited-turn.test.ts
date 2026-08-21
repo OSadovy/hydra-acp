@@ -1352,3 +1352,115 @@ describe("unsolicited turn attribution", () => {
     expect(hydraMeta(started[0]!).cause).toBeUndefined();
   });
 });
+
+// A steer that reaches the agent just after the turn it aimed at ended.
+//
+// Session.steer forwards `_session/steering` natively when hydra believes a
+// turn is in flight. That belief can be stale by the time the agent handles
+// the request: the adapter looks for a running turn of its own, finds none,
+// and -- unless the client asked for `idleBehavior: "promptRequired"` --
+// starts a detached turn and answers "startedNewTurn" (the `!turnInFlight`
+// branch of claude-agent-acp's steering handler).
+//
+// Hydra never asked for that turn, so its output arrives with no prompt in
+// flight and openUnsolicitedTurn compensates, exactly as it does for a
+// background-task resume. But this turn runs in the USER lane -- the user is
+// who asked for it -- so its terminal usage_update is stamped
+// {"kind":"human"}, which autonomousTurnTerminal rejects by design. Nothing
+// else ends an unsolicited turn, and there is deliberately no timer
+// fallback, so it never closes.
+describe("_session/steering into a turn that has just ended", () => {
+  async function steerIntoTheGap(meta?: Record<string, unknown>): Promise<{
+    session: Session;
+    mock: ReturnType<typeof makeMockAgent>;
+    client: AttachedClient;
+    outcome: unknown;
+  }> {
+    const { session, mock, client } = await makeSessionAfterOneTurn();
+    mock.agent.steeringSupported = true;
+
+    const requestMock = mock.agent.connection.request as ReturnType<typeof vi.fn>;
+    let settleTurn: (() => void) | undefined;
+    requestMock.mockImplementation((method: string, params?: unknown) => {
+      if (method === "session/prompt") {
+        return new Promise((resolve) => {
+          settleTurn = () => resolve({ stopReason: "end_turn" });
+        });
+      }
+      if (method === "_session/steering") {
+        // Mirrors claude-agent-acp's idle branch: the turn this steer
+        // aimed at has already settled on the agent's side.
+        const idleBehavior = (
+          params as
+            | { _meta?: { steering?: { idleBehavior?: unknown } } }
+            | undefined
+        )?._meta?.steering?.idleBehavior;
+        return Promise.resolve(
+          idleBehavior === "promptRequired"
+            ? { outcome: "promptRequired", reason: "noRunningTurn" }
+            : { outcome: "startedNewTurn" },
+        );
+      }
+      return Promise.resolve({});
+    });
+
+    void session.prompt(client.clientId, {
+      sessionId: "sess_u",
+      prompt: [{ type: "text", text: "the turn being steered" }],
+    });
+    await new Promise((r) => setImmediate(r));
+
+    const outcome = await session.steer(client.clientId, {
+      sessionId: "sess_u",
+      prompt: [{ type: "text", text: "actually, do X instead" }],
+      ...(meta ? { _meta: meta } : {}),
+    });
+
+    // The turn hydra was tracking settles now. It had already ended on the
+    // agent's side -- that is what made the steer miss.
+    settleTurn?.();
+    await settleDrain();
+
+    if ((outcome as { outcome?: string }).outcome === "startedNewTurn") {
+      // The turn the agent started for the steer streams in, then ends.
+      agentChunk(mock, "doing X instead");
+      humanTerminal(mock);
+      await settleDrain();
+    }
+
+    return { session, mock, client, outcome };
+  }
+
+  it("leaves the session BUSY for good when the client did not opt out", async () => {
+    const { session, outcome } = await steerIntoTheGap();
+    expect(outcome).toEqual({ outcome: "startedNewTurn" });
+    // The agent is finished. Hydra has not noticed, and never will.
+    expect(session.isQuiescedSync()).toBe(true);
+  });
+
+  it("holds every later prompt behind the turn that will not close", async () => {
+    const { session, client } = await steerIntoTheGap();
+    let settled = false;
+    void session
+      .prompt(client.clientId, {
+        sessionId: "sess_u",
+        prompt: [{ type: "text", text: "anything at all" }],
+      })
+      .then(() => {
+        settled = true;
+      });
+    await settleDrain();
+    // holdForUnsolicitedTurn is deliberately unbounded, and the supersede
+    // path that would close the turn (broadcastPromptReceived) is reached
+    // only once the entry is dispatched -- which the hold prevents.
+    expect(settled).toBe(true);
+  });
+
+  it("does not arise when the client asks for promptRequired", async () => {
+    const { session, outcome } = await steerIntoTheGap({
+      steering: { idleBehavior: "promptRequired" },
+    });
+    expect(outcome).toEqual({ outcome: "promptRequired", reason: "noRunningTurn" });
+    expect(session.isQuiescedSync()).toBe(true);
+  });
+});
